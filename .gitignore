@@ -1,0 +1,7 @@
+logs/
+target/
+dbt_modules/
+dbt_packages/
+profiles.yml
+.venv
+.DS_Store
