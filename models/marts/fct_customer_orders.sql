@@ -1,84 +1,63 @@
 with 
--- import ctes
 
+-- Staging models
 customers as (
-    select * from {{ source('jaffle_shop', 'customers') }}
+    select * from {{ ref('stg_jaffle_shop__customers') }}
 ),
 
-orders as (
-    select * from {{ source('jaffle_shop', 'orders') }}
-),
-
-payments as (
-    select * from {{ source('stripe', 'payment') }}
-),
-
--- Logical ctes
-
-p as (
-    select
-        orderid                 as order_id,
-        max(created)            as payment_finalized_date,
-        sum(amount) / 100.0     as total_amount_paid
-    from payments
-    where status <> 'fail'
-    group by 1
-),
-
+-- Intermediate models
 paid_orders as (
-    select
-        orders.id                   as order_id,
-        orders.user_id              as customer_id,
-        orders.order_date           as order_placed_at,
-        orders.status               as order_status,
-        p.total_amount_paid,
-        p.payment_finalized_date,
-        c.first_name                as customer_first_name,
-        c.last_name                 as customer_last_name
-    from orders
-    left join p
-        on orders.id = p.order_id
-    left join customers c
-        on orders.user_id = c.id
+    select * from {{ ref('int_orders') }}
 ),
 
-lifetime_value as (
+-- Final CTE
+
+final as (
     select
-    order_id,
-    sum(total_amount_paid) over(
-        partition by customer_id 
-        order by order_id
-        rows between unbounded preceding and current row
-    ) as cumulative_lifetime_value
+        paid_orders.order_id,
+        paid_orders.customer_id,
+        paid_orders.order_date,
+        paid_orders.order_status,
+        paid_orders.total_amount_paid,
+        paid_orders.payment_finalized_date,
+        customers.first_name,
+        customers.last_name,
+
+        -- sales transaction sequence
+        row_number() over (order by paid_orders.order_date, paid_orders.order_id) as transaction_seq,
+
+        -- customer sales sequence
+        row_number() over (
+            partition by paid_orders.customer_id
+            order by paid_orders.order_date, paid_orders.order_id
+        ) as customer_sales_seq,
+
+        -- new vs returning customer
+        case 
+            when (
+                rank() over (
+                    partition by paid_orders.customer_id
+                    order by paid_orders.order_date, paid_orders.order_id
+                ) = 1
+            ) then 'new'
+        else 'return' end as nvsr,
+
+        -- customer lifetime value
+        sum(paid_orders.total_amount_paid) over (
+            partition by paid_orders.customer_id
+            order by paid_orders.order_date, paid_orders.order_id
+        ) as customer_lifetime_value,
+
+        -- first day of sale
+        first_value(paid_orders.order_date) over (
+            partition by paid_orders.customer_id
+            order by paid_orders.order_date, paid_orders.order_id
+        ) as fdos
     from paid_orders
-    order by order_id
-),
-
--- final cte
-
-final as (select
-    p.*,
-    row_number() over (order by p.order_id)                             as transaction_seq,
-    row_number() over (partition by p.customer_id order by p.order_id)    as customer_sales_seq,
-
-    -- Defines whether or not the customer is a new customer
-    case
-        when (
-            rank() over(
-                partition by customer_id
-                order by p.order_placed_at, p.order_id
-            ) = 1
-        ) then 'new'
-        else 'return'
-    end as nvsr,
-
-    lifetime_value.cumulative_lifetime_value,
-    min(p.order_placed_at) over(partition by p.customer_id) as fdos
-    from paid_orders p
-    left outer join lifetime_value
-        on lifetime_value.order_id = p.order_id
-    order by order_id
+    left join customers on paid_orders.customer_id = customers.customer_id        
 )
--- final select statement
+
+-- Simple Select Statement
 
 select * from final
+order by order_id
